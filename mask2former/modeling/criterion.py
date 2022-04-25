@@ -10,10 +10,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from detectron2.utils.comm import get_world_size
-from detectron2.projects.point_rend.point_features import (
-    get_uncertain_point_coords_with_randomness,
-    point_sample,
-)
+# from detectron2.projects.point_rend.point_features import (
+#     get_uncertain_point_coords_with_randomness,
+#     point_sample,
+# )
 
 from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
 
@@ -45,29 +45,32 @@ dice_loss_jit = torch.jit.script(
 )  # type: torch.jit.ScriptModule
 
 
-def sigmoid_ce_loss(
-        inputs: torch.Tensor,
-        targets: torch.Tensor,
-        num_masks: float,
-    ):
+def sigmoid_focal_loss(inputs, targets, num_masks, alpha: float = 0.25, gamma: float = 2):
     """
+    Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
     Args:
         inputs: A float tensor of arbitrary shape.
                 The predictions for each example.
         targets: A float tensor with the same shape as inputs. Stores the binary
                  classification label for each element in inputs
                 (0 for the negative class and 1 for the positive class).
+        alpha: (optional) Weighting factor in range (0,1) to balance
+                positive vs negative examples. Default = -1 (no weighting).
+        gamma: Exponent of the modulating factor (1 - p_t) to
+               balance easy vs hard examples.
     Returns:
         Loss tensor
     """
-    loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    prob = inputs.sigmoid()
+    ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    p_t = prob * targets + (1 - prob) * (1 - targets)
+    loss = ce_loss * ((1 - p_t) ** gamma)
+
+    if alpha >= 0:
+        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+        loss = alpha_t * loss
 
     return loss.mean(1).sum() / num_masks
-
-
-sigmoid_ce_loss_jit = torch.jit.script(
-    sigmoid_ce_loss
-)  # type: torch.jit.ScriptModule
 
 
 def calculate_uncertainty(logits):
@@ -94,8 +97,8 @@ class SetCriterion(nn.Module):
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
 
-    def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
-                 num_points, oversample_ratio, importance_sample_ratio):
+    def __init__(self, num_classes, weight_dict, eos_coef, losses,
+                 num_points=None, oversample_ratio=None, importance_sample_ratio=None, matcher=None):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -106,7 +109,7 @@ class SetCriterion(nn.Module):
         """
         super().__init__()
         self.num_classes = num_classes
-        self.matcher = matcher
+        self.matcher = None
         self.weight_dict = weight_dict
         self.eos_coef = eos_coef
         self.losses = losses
@@ -115,9 +118,9 @@ class SetCriterion(nn.Module):
         self.register_buffer("empty_weight", empty_weight)
 
         # pointwise mask loss parameters
-        self.num_points = num_points
-        self.oversample_ratio = oversample_ratio
-        self.importance_sample_ratio = importance_sample_ratio
+        # self.num_points = num_points
+        # self.oversample_ratio = oversample_ratio
+        # self.importance_sample_ratio = importance_sample_ratio
 
     def loss_labels(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
@@ -146,6 +149,8 @@ class SetCriterion(nn.Module):
         src_idx = self._get_src_permutation_idx(indices)
         tgt_idx = self._get_tgt_permutation_idx(indices)
         src_masks = outputs["pred_masks"]
+        if src_masks.dim() != 4:
+            return {"no_loss": 0}
         src_masks = src_masks[src_idx]
         masks = [t["masks"] for t in targets]
         # TODO use valid to mask invalid areas due to padding in loss
@@ -153,40 +158,18 @@ class SetCriterion(nn.Module):
         target_masks = target_masks.to(src_masks)
         target_masks = target_masks[tgt_idx]
 
-        # No need to upsample predictions as we are using normalized coordinates :)
-        # N x 1 x H x W
-        src_masks = src_masks[:, None]
-        target_masks = target_masks[:, None]
+        # upsample predictions to the target size
+        src_masks = F.interpolate(
+            src_masks[:, None], size=target_masks.shape[-2:], mode="bilinear", align_corners=False
+        )
+        src_masks = src_masks[:, 0].flatten(1)
 
-        with torch.no_grad():
-            # sample point_coords
-            point_coords = get_uncertain_point_coords_with_randomness(
-                src_masks,
-                lambda logits: calculate_uncertainty(logits),
-                self.num_points,
-                self.oversample_ratio,
-                self.importance_sample_ratio,
-            )
-            # get gt labels
-            point_labels = point_sample(
-                target_masks,
-                point_coords,
-                align_corners=False,
-            ).squeeze(1)
-
-        point_logits = point_sample(
-            src_masks,
-            point_coords,
-            align_corners=False,
-        ).squeeze(1)
-
+        target_masks = target_masks.flatten(1)
+        target_masks = target_masks.view(src_masks.shape)
         losses = {
-            "loss_mask": sigmoid_ce_loss_jit(point_logits, point_labels, num_masks),
-            "loss_dice": dice_loss_jit(point_logits, point_labels, num_masks),
+            "loss_mask": sigmoid_focal_loss(src_masks, target_masks, num_masks),
+            "loss_dice": dice_loss(src_masks, target_masks, num_masks),
         }
-
-        del src_masks
-        del target_masks
         return losses
 
     def _get_src_permutation_idx(self, indices):
@@ -219,7 +202,13 @@ class SetCriterion(nn.Module):
         outputs_without_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
 
         # Retrieve the matching between the outputs of the last layer and the targets
-        indices = self.matcher(outputs_without_aux, targets)
+        # indices = self.matcher(outputs_without_aux, targets)
+        labels = [x['labels'] for x in targets]
+        indices_new = []
+        for label in labels:
+            t = torch.arange(len(label))
+            indices_new.append([label, t])
+        indices = indices_new
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_masks = sum(len(t["labels"]) for t in targets)
@@ -238,7 +227,7 @@ class SetCriterion(nn.Module):
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if "aux_outputs" in outputs:
             for i, aux_outputs in enumerate(outputs["aux_outputs"]):
-                indices = self.matcher(aux_outputs, targets)
+                # indices = self.matcher(aux_outputs, targets)
                 for loss in self.losses:
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_masks)
                     l_dict = {k + f"_{i}": v for k, v in l_dict.items()}
@@ -249,14 +238,14 @@ class SetCriterion(nn.Module):
     def __repr__(self):
         head = "Criterion " + self.__class__.__name__
         body = [
-            "matcher: {}".format(self.matcher.__repr__(_repr_indent=8)),
             "losses: {}".format(self.losses),
             "weight_dict: {}".format(self.weight_dict),
             "num_classes: {}".format(self.num_classes),
             "eos_coef: {}".format(self.eos_coef),
-            "num_points: {}".format(self.num_points),
-            "oversample_ratio: {}".format(self.oversample_ratio),
-            "importance_sample_ratio: {}".format(self.importance_sample_ratio),
+            # "matcher: {}".format(self.matcher.__repr__(_repr_indent=8)),
+            # "num_points: {}".format(self.num_points),
+            # "oversample_ratio: {}".format(self.oversample_ratio),
+            # "importance_sample_ratio: {}".format(self.importance_sample_ratio),
         ]
         _repr_indent = 4
         lines = [head] + [" " * _repr_indent + line for line in body]
